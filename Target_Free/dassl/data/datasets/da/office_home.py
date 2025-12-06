@@ -21,7 +21,8 @@ class OfficeHome(DatasetBase):
         Domain Adaptation. CVPR 2017.
     """
 
-    dataset_dir = "office_home"
+    #dataset_dir = "office_home"
+    dataset+dir = "OfficeHomeDataset_10072016"
     #domains = ["art", "clipart", "product", "real_world"]
     domains = ["Art", "Clipart", "Product", "Real_World"]
 
