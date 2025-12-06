@@ -14,6 +14,7 @@ from tqdm import tqdm
 
 from dassl.engine import TRAINER_REGISTRY, TrainerXU
 from dassl.metrics import compute_accuracy
+from transformers import AutoImageProcessor, AutoModel
 from dassl.utils import MetricMeter, AverageMeter, load_pretrained_weights, load_checkpoint, save_checkpoint
 from dassl.optim import build_optimizer, build_lr_scheduler
 
@@ -25,20 +26,78 @@ _tokenizer = _Tokenizer()
 
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.MODEL.BACKBONE.NAME
-    url = clip._MODELS[backbone_name]
-    model_path = clip._download(url, cfg.MODEL.BACKBONE.PATH)
+    clip_name = getattr(cfg.MODEL.BACKBONE, "CLIP_NAME", backbone_name)
 
+    if clip_name not in clip._MODELS:
+        raise KeyError(
+            f"CLIP backbone '{clip_name}' not found in registry."
+            " Set MODEL.BACKBONE.CLIP_NAME to a valid CLIP variant."
+        )
+
+    url = clip._MODELS[clip_name]
+    model_path = clip._download(url, cfg.MODEL.BACKBONE.PATH)
 
     try:
         model = torch.jit.load(model_path, map_location="cpu").eval()
         state_dict = None
-
     except RuntimeError:
         state_dict = torch.load(model_path, map_location="cpu")
 
     model = clip.build_model(state_dict or model.state_dict())
-
     return model
+
+
+def load_dinov3_to_cpu():
+    """Load DINOv3 weights for use as a frozen vision backbone."""
+
+    processor = AutoImageProcessor.from_pretrained("facebook/dinov3-vitl16-pretrain-lvd1689m")
+    model = AutoModel.from_pretrained("facebook/dinov3-vitl16-pretrain-lvd1689m")
+    model.eval()
+    return model, processor
+
+
+class VisionProjectionHead(nn.Module):
+    """Trainable projector that aligns DINOv3 features with CLIP's text space."""
+
+    def __init__(self, in_dim=1024, out_dim=512, hidden_dim=768):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, out_dim)
+        )
+
+    def forward(self, x):
+        return self.proj(x)
+
+
+class DinoVisionWrapper(nn.Module):
+    """Wraps a DINOv3 backbone to mimic CLIP vision encoder outputs."""
+
+    def __init__(self, dino_model, projection_head, num_layers=12):
+        super().__init__()
+        self.model = dino_model
+        self.projection_head = projection_head
+        self.num_layers = num_layers
+
+    def forward(self, images):
+        # Always run the vision transformer in fp32 for stability
+        with torch.cuda.amp.autocast(enabled=False):
+            pixel_values = images.float()
+            outputs = self.model(
+                pixel_values=pixel_values,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+
+        if outputs.hidden_states is None:
+            raise RuntimeError("DINOv3 backbone must return hidden states for prompt learner")
+
+        hidden_states = list(outputs.hidden_states[-self.num_layers:])
+        data = [hs.to(images.dtype) for hs in hidden_states]
+        cls_feat = outputs.last_hidden_state[:, 0, :]
+        projected = self.projection_head(cls_feat).to(images.dtype)
+        return projected, data
 
 
 class AdaIN(nn.Module):
@@ -55,10 +114,10 @@ class AdaIN(nn.Module):
 class domain_projector(nn.Module):
     def __init__(self):
         super().__init__()
-        self.linear1 = nn.ModuleList(nn.Linear(768, 256) for _ in range (12))
+        self.linear1 = nn.ModuleList(nn.Linear(1024, 256) for _ in range (12))
         self.linear2 = nn.ModuleList(nn.Linear(256, 512) for _ in range (12))
         self.adain=AdaIN()
-        self.gap=nn.AdaptiveAvgPool2d((1, 768))
+        self.gap=nn.AdaptiveAvgPool2d((1, 1024))
     def forward(self, data):
         data_prompt = []
         for i in range(len(data)):
@@ -77,10 +136,10 @@ class domain_projector(nn.Module):
 class image_projector(nn.Module):
     def __init__(self):
         super().__init__()
-        self.linear = nn.ModuleList(nn.Linear(768, 512) for _ in range (12))
+        self.linear = nn.ModuleList(nn.Linear(1024, 512) for _ in range (12))
         self.adain=AdaIN()
         self.lin = nn.Linear(12,1)
-        self.gap=nn.AdaptiveAvgPool2d((1,768))
+        self.gap=nn.AdaptiveAvgPool2d((1,1024))
     
     def forward(self, data, n_imgctx):
         data_prompt=[]
@@ -101,11 +160,11 @@ class image_projector(nn.Module):
 class style_mapping_projector(nn.Module):
     def __init__(self):
         super().__init__()
-        self.linear1 = nn.ModuleList(nn.Linear(768, 384) for _ in range(12))
+        self.linear1 = nn.ModuleList(nn.Linear(1024, 384) for _ in range(12))
         self.linear2 = nn.ModuleList(nn.Linear(384, 512) for _ in range(12))
         self.adain = AdaIN()
         self.relu = nn.ReLU()
-        self.gap=nn.AdaptiveAvgPool1d((768))
+        self.gap=nn.AdaptiveAvgPool1d((1024))
     def forward(self, data):
         data_prompt = []
         for i in range(len(data)):
@@ -301,6 +360,7 @@ class CustomCLIP(nn.Module):
         target_feat_bank = torch.zeros((self.n_cls * self.K, self.dim))
         self.source_feat_bank = nn.Parameter(source_feat_bank)
         self.target_feat_bank = nn.Parameter(target_feat_bank)
+        self.vision_proj = None
 
     @autocast()
     def forward(self, s_image, t_image=None, label=None, domain=None):
@@ -434,7 +494,8 @@ class IPCLIPB16(TrainerXU):
         classnames = self.dm.dataset.classnames
         print('******************************************')
         # print('classnames', classnames)
-        print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
+        backbone_name = cfg.MODEL.BACKBONE.NAME
+        print(f"Loading CLIP (backbone: {backbone_name})")
         clip_model = load_clip_to_cpu(cfg)
         self.dim = clip_model.text_projection.shape[1]
 
@@ -445,16 +506,33 @@ class IPCLIPB16(TrainerXU):
         print("Building custom CLIP")
         self.model = CustomCLIP(cfg, classnames, clip_model)
 
+        use_dino = "dino" in backbone_name.lower()
+        if use_dino:
+            print("Replacing CLIP vision encoder with DINOv3 backbone")
+            dino_model, _ = load_dinov3_to_cpu()
+            for param in dino_model.parameters():
+                param.requires_grad_(False)
+
+            hidden_dim = getattr(dino_model.config, "hidden_size", 768)
+            num_layers = min(12, getattr(dino_model.config, "num_hidden_layers", 12))
+            vision_proj = VisionProjectionHead(in_dim=hidden_dim, out_dim=self.dim, hidden_dim=hidden_dim)
+            dino_wrapper = DinoVisionWrapper(dino_model, vision_proj, num_layers=num_layers)
+            self.model.image_encoder = dino_wrapper
+            self.model.vision_proj = vision_proj
+
         self.n_cls = self.model.prompt_learner.n_cls
 
-        name_to_update1 = "prompt_learner"
-        name_to_update2 = "attn_block"
+        trainable_scopes = ["prompt_learner", "attn_block"]
+        if self.model.vision_proj is not None:
+            trainable_scopes.append("vision_proj")
+            trainable_scopes.append("image_encoder.projection_head")
 
-        # 冻结prompt_learner以外的层
+        # 冻结非必要層，確保 DINO backbone 保持凍結
         for name, param in self.model.named_parameters():
-            if name_to_update1 not in name:
-                if name_to_update2 not in name:
-                    param.requires_grad_(False)
+            if any(scope in name for scope in trainable_scopes):
+                param.requires_grad_(True)
+            else:
+                param.requires_grad_(False)
 
         # Double check
         enabled = set()
@@ -469,6 +547,9 @@ class IPCLIPB16(TrainerXU):
                                     cfg.MODEL.INIT_WEIGHTS)
 
         self.model.to(self.device)
+        if use_dino:
+            self.model.image_encoder.to(self.device)
+            self.model.vision_proj.to(self.device)
 
         # transform the epoch to step schedule
         len_train_loader_x = len(self.train_loader_x)
@@ -482,8 +563,12 @@ class IPCLIPB16(TrainerXU):
         else:
             raise ValueError
 
-        # NOTE: only give prompt_learner to the optimizer
-        self.optim = build_optimizer(self.model.prompt_learner, cfg.OPTIM)
+        # NOTE: give all trainable heads to the optimizer
+        optim_modules = [self.model.prompt_learner]
+        if self.model.vision_proj is not None:
+            optim_modules.append(self.model.vision_proj)
+        optim_target = optim_modules[0] if len(optim_modules) == 1 else nn.ModuleList(optim_modules)
+        self.optim = build_optimizer(optim_target, cfg.OPTIM)
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
         '''
         register model could be updated. When new module needs to be updated
@@ -491,6 +576,9 @@ class IPCLIPB16(TrainerXU):
         '''
         self.register_model("prompt_learner", self.model.prompt_learner,
                             self.optim, self.sched)
+        if self.model.vision_proj is not None:
+            self.register_model("vision_proj", self.model.vision_proj,
+                                self.optim, self.sched)
 
         self.scaler = GradScaler() if cfg.TRAINER.IPCLIPB16.PREC == "amp" else None  # 自动混合精度训练（Automatic Mixed Precision, AMP）
         self.construct_bank()
@@ -699,10 +787,15 @@ class IPCLIPB16(TrainerXU):
 
         if do_test:
             curr_result_train, curr_result_test1, curr_result_test2, curr_result_test3, curr_result_test4 = self.test()
+            #self.save_model(self.epoch,
+            #                self.output_dir,
+            #                model_name="model--{}--{:.2f}-->{:.2f}-->{:.2f}-->{:.2f}-->{:.2f}.pth.tar".format(self.epoch, curr_result_train, curr_result_test1, curr_result_test2, curr_result_test3, curr_result_test4))
+
             self.save_model(self.epoch,
                             self.output_dir,
-                            model_name="model--{}--{:.2f}-->{:.2f}-->{:.2f}-->{:.2f}-->{:.2f}.pth.tar".format(self.epoch, curr_result_train, curr_result_test1, curr_result_test2, curr_result_test3, curr_result_test4))
+                            model_name="model-epoch{}.pth.tar".format(self.epoch))
 
+            
             self.set_model_mode("train")
 
         if meet_checkpoint_freq or last_epoch:
