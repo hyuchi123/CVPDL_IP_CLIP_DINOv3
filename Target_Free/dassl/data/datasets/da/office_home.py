@@ -22,7 +22,7 @@ class OfficeHome(DatasetBase):
     """
 
     #dataset_dir = "office_home"
-    dataset+dir = "OfficeHomeDataset_10072016"
+    dataset_dir = "OfficeHomeDataset_10072016"
     #domains = ["art", "clipart", "product", "real_world"]
     domains = ["Art", "Clipart", "Product", "Real_World"]
 
