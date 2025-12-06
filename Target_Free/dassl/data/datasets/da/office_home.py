@@ -24,7 +24,7 @@ class OfficeHome(DatasetBase):
     #dataset_dir = "office_home"
     dataset_dir = "OfficeHomeDataset_10072016"
     #domains = ["art", "clipart", "product", "real_world"]
-    domains = ["Art", "Clipart", "Product", "Real_World"]
+    domains = ["Art", "Clipart", "Product", "Real World"]
 
 
     def __init__(self, cfg):
